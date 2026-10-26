@@ -1,0 +1,125 @@
+name: SecureFlow Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['dashboard/**', 'terraform/**', '**.md']
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  NEON_URL: ${{ secrets.NEON_URL }}
+  NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare + register run
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/secureflow-app" >> $GITHUB_ENV
+          echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq
+          chmod +x scripts/*.sh
+          psql "$NEON_URL" -q -v run="$GITHUB_RUN_ID" -v sha="$GITHUB_SHA" -v actor="$GITHUB_ACTOR" -v msg="$COMMIT_MSG" <<'SQL'
+          INSERT INTO pipeline_runs(run_id, commit_sha, commit_msg, actor) VALUES (:'run', :'sha', :'msg', :'actor') ON CONFLICT DO NOTHING;
+          SQL
+
+      # ---------- BUILD ----------
+      - name: BUILD
+        run: |
+          scripts/report.sh BUILD running
+          docker build -t "$IMAGE:$TAG" .
+          scripts/report.sh BUILD success
+
+      # ---------- SCAN ----------
+      - name: SCAN (Trivy report)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ env.TAG }}
+          format: json
+          output: trivy.json
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: SCAN - record results + SECURITY GATE
+        run: |
+          scripts/report.sh SCAN running
+          count() { jq "[.Results[]?.Vulnerabilities[]? | select(.Severity==\"$1\")] | length" trivy.json; }
+          C=$(count CRITICAL); H=$(count HIGH); M=$(count MEDIUM); L=$(count LOW)
+          PASS=true; [ $((C + H)) -gt 0 ] && PASS=false
+          psql "$NEON_URL" -q -v run="$GITHUB_RUN_ID" -v img="$IMAGE:$TAG" -v c="$C" -v h="$H" -v m="$M" -v l="$L" -v p="$PASS" <<'SQL'
+          INSERT INTO scan_results(run_id, image, critical, high, medium, low, gate_passed) VALUES (:'run', :'img', :c, :h, :m, :l, :'p');
+          SQL
+          if [ "$PASS" = "false" ]; then
+            scripts/report.sh SCAN failed "critical=$C high=$H"
+            curl -s -H "Title: SecureFlow BLOCKED" -H "Priority: high" \
+              -d "Security gate blocked $TAG: $C critical, $H high" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
+            echo "::error::Security gate failed: $C critical, $H high"
+            exit 1
+          fi
+          scripts/report.sh SCAN success "critical=$C high=$H"
+
+      # ---------- POLICY CHECK ----------
+      - name: Checkout manifests repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/secureflow-manifests
+          token: ${{ secrets.MANIFEST_PAT }}
+          path: manifests
+
+      - name: POLICY-CHECK (Conftest)
+        run: |
+          scripts/report.sh POLICY running
+          curl -sL https://github.com/open-policy-agent/conftest/releases/download/v0.56.0/conftest_0.56.0_Linux_x86_64.tar.gz | tar xz conftest
+          if ./conftest test manifests/k8s -p policy; then
+            scripts/report.sh POLICY success
+          else
+            scripts/report.sh POLICY failed
+            curl -s -H "Title: SecureFlow BLOCKED" -H "Priority: high" \
+              -d "Policy check failed for $TAG" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
+            exit 1
+          fi
+
+      # ---------- PUBLISH ----------
+      - name: PUBLISH (GHCR)
+        run: |
+          scripts/report.sh PUBLISH running
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:$TAG"
+          scripts/report.sh PUBLISH success
+
+      # ---------- MANIFEST UPDATE (GitOps handoff) ----------
+      - name: MANIFEST-UPDATE
+        run: |
+          scripts/report.sh MANIFEST-UPDATE running
+          cd manifests
+          sed -i "s|image: .*|image: $IMAGE:$TAG|" k8s/deployment.yaml
+          git config user.name "secureflow-bot"
+          git config user.email "bot@secureflow.local"
+          git commit -am "deploy: $TAG (run $GITHUB_RUN_ID)"
+          git push
+          cd ..
+          scripts/report.sh MANIFEST-UPDATE success
+          scripts/report.sh SYNC pending "Argo CD will pick up $TAG"
+
+      # ---------- NOTIFY ----------
+      - name: NOTIFY
+        run: |
+          curl -s -H "Title: SecureFlow" -d "Image $TAG passed all gates and was handed to Argo CD" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null
+          scripts/report.sh NOTIFY success
+
+      - name: Finalize run status
+        if: always()
+        env:
+          STATUS: ${{ job.status }}
+        run: |
+          psql "$NEON_URL" -q -v run="$GITHUB_RUN_ID" -v s="$STATUS" <<'SQL'
+          UPDATE pipeline_runs SET status = :'s', finished_at = now() WHERE run_id = :'run';
+          SQL
