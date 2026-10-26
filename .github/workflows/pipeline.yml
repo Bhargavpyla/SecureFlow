@@ -108,6 +108,13 @@ jobs:
           cd ..
           scripts/report.sh MANIFEST-UPDATE success
           scripts/report.sh SYNC pending "Argo CD will pick up $TAG"
+          psql "$NEON_URL" -q \
+          -v run="$GITHUB_RUN_ID" \
+          -v tag="$TAG" <<'SQL'
+          INSERT INTO deployments (run_id, image_tag, status, details)
+          VALUES (:'run', :'tag', 'pending',
+                  'Image handed to Argo CD; rollout verification pending');
+          SQL
 
       # ---------- NOTIFY ----------
       - name: NOTIFY
