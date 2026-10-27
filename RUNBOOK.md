@@ -36,3 +36,5 @@ Install Argo CD:
 - Trivy DB download can hit a GHCR rate limit; just re-run the job.
 - If `python:3.12-slim` shows HIGH findings, bump to the newest patch tag or add `RUN apt-get update && apt-get upgrade -y`. Check this EARLY (hour 3), not at demo time.
 - Rolling back is not automatic with plain Argo CD. Describe it as "failed rollouts stall while the old version keeps serving; recovery is `git revert`".
+
+## Added a line
