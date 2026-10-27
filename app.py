@@ -7,7 +7,9 @@ from psycopg.rows import dict_row
 
 load_dotenv()
 app = Flask(__name__)
-
+@app.get("/health")
+def health():
+    return {"status": "ok"}, 200
 QUERIES = {
     'runs': 'SELECT run_id, commit_sha, commit_msg, actor, status, started_at, finished_at FROM pipeline_runs ORDER BY started_at DESC LIMIT 100',
     'stages': 'SELECT id, run_id, stage, status, details, created_at FROM stage_events ORDER BY created_at DESC LIMIT 500',
