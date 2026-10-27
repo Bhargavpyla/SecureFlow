@@ -1,0 +1,9 @@
+.env
+dashboard/
+backup_app.py
+.git
+__pycache__
+*.md
+scripts/
+sql/
+policy/
