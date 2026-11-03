@@ -2,7 +2,7 @@ import socket
 from flask import Flask, jsonify, render_template_string
 
 # ── Easy-edit constants for demo pushes ──────────────────────────
-SITE_VERSION = "v2"
+SITE_VERSION = "v3"
 SITE_COLOR   = "#2563eb"          # page background colour
 # ─────────────────────────────────────────────────────────────────
 
